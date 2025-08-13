@@ -8,6 +8,7 @@ from flask_cors import CORS
 from sqlalchemy import desc
 from flask_migrate import Migrate
 from database import db, Interview, JobDescription, Activity
+from datetime import datetime, timedelta
 
 # --- 1. INITIALIZATION & CONFIG ---
 load_dotenv()
@@ -16,7 +17,7 @@ CORS(app)
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URI', 'sqlite:///interviews.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db.init_app(app)
-migrate = Migrate(app, db) # Kept for future use if needed
+migrate = Migrate(app, db)
 
 # --- API KEYS & MODELS ---
 VAPI_API_KEY, VAPI_PHONE_NUMBER_ID, GEMINI_API_KEY = os.getenv('VAPI_API_KEY'), os.getenv('VAPI_PHONE_NUMBER_ID'), os.getenv('GEMINI_API_KEY')
@@ -71,7 +72,7 @@ def get_dashboard_data():
             "in_progress_count": in_progress_count
         }
         up_next = Interview.query.filter_by(status='completed').order_by(desc(Interview.id)).limit(5).all()
-        activities = Activity.query.order_by(desc(Activity.timestamp)).limit(5).all()
+        activities = Activity.query.order_by(desc(Activity.timestamp)).limit(10).all()
 
         return jsonify({ "stats": stats, "up_next": [i.to_dict() for i in up_next], "activities": [a.to_dict() for a in activities] })
     except Exception as e:
@@ -104,6 +105,18 @@ def analyze_resumes():
 @app.route('/api/interviews', methods=['GET'])
 def list_interviews():
     try:
+        # LOGIC FOR STUCK CALLS
+        timeout_threshold = datetime.utcnow() - timedelta(minutes=20)
+        stuck_interviews = Interview.query.filter(
+            Interview.status.in_(['calling', 'analyzing']),
+            Interview.last_status_change < timeout_threshold
+        ).all()
+        for interview in stuck_interviews:
+            interview.status = 'failed'
+            log_activity(f"Call with {interview.candidate_name} timed out.")
+        if stuck_interviews:
+            db.session.commit()
+
         page, per_page = request.args.get('page', 1, type=int), request.args.get('per_page', 8, type=int)
         search_term, status_filter = request.args.get('search', '', type=str), request.args.get('status', 'all', type=str)
         query = Interview.query.filter(Interview.status != 'error')
@@ -166,7 +179,7 @@ def start_interview_call(interview_id):
         return jsonify(interview.to_dict()), 200
     except requests.exceptions.RequestException as e:
         error_details = f"Failed to start call: {e.response.text if e.response else str(e)}"; print(f"ERROR: {error_details}")
-        interview.status = 'error'; db.session.commit()
+        interview.status = 'failed'; db.session.commit()
         return jsonify({"error": error_details}), 500
 
 @app.route('/api/interviews/delete', methods=['DELETE'])
@@ -190,6 +203,15 @@ def vapi_webhook():
     interview = db.session.get(Interview, interview_id)
     if not interview: return jsonify({"status": "error", "reason": f"ID {interview_id} not found"}), 404
     message = payload['message']
+    
+    # Handle unsuccessful calls
+    if message.get('endedReason') and message.get('endedReason') != 'hangup':
+        interview.status = 'failed'
+        interview.assessment = f"Call failed. Reason: {message.get('endedReason')}"
+        db.session.commit()
+        log_activity(f"Call with {interview.candidate_name} failed: {message.get('endedReason')}")
+        return jsonify({"status": "received"}), 200
+
     interview.transcript = message.get('transcript'); interview.duration_in_seconds = int(message.get('durationSeconds') or 0); interview.recording_url = message.get('recordingUrl'); interview.status = 'analyzing'
     db.session.commit()
     analyze_transcript(interview)
@@ -198,8 +220,6 @@ def vapi_webhook():
 def analyze_transcript(interview):
     if not gemini_model:
         interview.status = 'error'; interview.assessment = "Error: Gemini model not configured."; db.session.commit(); return
-    
-    # NEW DETAILED PROMPT
     analysis_prompt = f"""
     Analyze the interview transcript for the '{interview.job_position}' role, assessed on '{interview.skills_to_assess}'.
     Job Description: {interview.job_description}
@@ -218,17 +238,10 @@ def analyze_transcript(interview):
     try:
         response = gemini_model.generate_content(analysis_prompt)
         analysis = json.loads(response.text.strip().replace('```json', '').replace('```', ''))
-        
-        interview.assessment = analysis.get('assessment')
-        interview.score = int(analysis.get('score', 0))
-        interview.recommendation = analysis.get('recommendation')
-        interview.comm_score = int(analysis.get('comm_score', 0))
-        interview.tech_score = int(analysis.get('tech_score', 0))
-        interview.relevance_score = int(analysis.get('relevance_score', 0))
+        interview.assessment = analysis.get('assessment'); interview.score = int(analysis.get('score', 0)); interview.recommendation = analysis.get('recommendation'); interview.comm_score = int(analysis.get('comm_score', 0)); interview.tech_score = int(analysis.get('tech_score', 0)); interview.relevance_score = int(analysis.get('relevance_score', 0));
         interview.status = 'completed'
-        
         log_activity(f"Analysis complete for {interview.candidate_name}.")
-    except (Exception, json.JSONDecodeError) as e:
+    except Exception as e:
         print(f"ERROR: Gemini analysis failed for interview {interview.id}: {e}")
         interview.status = 'error'; interview.assessment = f"Error during AI analysis: {e}"
     db.session.commit()

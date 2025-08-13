@@ -14,15 +14,17 @@ class Interview(db.Model):
     transcript = db.Column(db.Text, nullable=True)
     duration_in_seconds = db.Column(db.Integer, nullable=True)
     recording_url = db.Column(db.String(500), nullable=True)
-    analysis_summary = db.Column(db.Text, nullable=True)
     assessment = db.Column(db.Text, nullable=True)
-    score = db.Column(db.Integer, nullable=True) # Overall AI Score
+    score = db.Column(db.Integer, nullable=True)
     recommendation = db.Column(db.String(50), nullable=True)
     
-    # NEW DETAILED ANALYSIS FIELDS
+    # Detailed Analysis Fields
     comm_score = db.Column(db.Integer, nullable=True)
     tech_score = db.Column(db.Integer, nullable=True)
     relevance_score = db.Column(db.Integer, nullable=True)
+    
+    # NEW: Timestamp for tracking stuck calls
+    last_status_change = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def to_dict(self):
         return {c.name: getattr(self, c.name) for c in self.__table__.columns}
